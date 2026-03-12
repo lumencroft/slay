@@ -1,118 +1,76 @@
-import socket
-import json
 import sys
-import time
+from spire_socket import SpireSocketServer
 from state_parser import parse_state, print_state_summary
+from combat_ai import CombatAI
+from choice_ai import ChoiceAI
 
 def main():
-    HOST = '127.0.0.1'
-    PORT = 7777
+    print("=== 4090 AI 딥러닝 서버 (무한 자동화) ===")
     
-    print("=== 4090 AI 서버 예열 중... ===")
+    # 분리된 통신 모듈과 AI 모듈 장전
+    server = SpireSocketServer(host='0.0.0.0', port=7777)
+    combat_ai = CombatAI()
+    choice_ai = ChoiceAI()
+
     try:
         import torch
         print(f"GPU 활성화 성공: {torch.cuda.get_device_name(0)}")
     except:
         pass
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(1)
-    server.settimeout(1.0) 
-    
-    print(f"=== 4090 본진 수신 대기 중 (포트 {PORT}) ===")
-    
     while True:
         try:
-            try:
-                conn, addr = server.accept()
-            except socket.timeout:
-                continue 
+            # 1. 게임 연결 대기
+            server.wait_for_connection()
             
-            print(f"\n[!] 슬더스 게임 접속 완료! {addr}")
-            
-            # [핵심] makefile()을 빼고, 0.5초 타임아웃을 걸어 숨통을 틔웁니다.
-            conn.settimeout(0.5) 
-            buffer = ""
-            
-            last_command_time = 0
-            command_cooldown = 0.5  
-            
-            waiting_for_next_turn = False
-            last_turn = -1
-            need_to_print_state = True 
-            
-            with conn:
-                while True:
-                    try:
-                        # 통째로 데이터를 받아서 버퍼에 이어 붙입니다.
-                        chunk = conn.recv(4096).decode('utf-8')
-                        if not chunk:
-                            break # 빈 문자열이면 연결이 끊긴 것
-                        buffer += chunk
-                    except socket.timeout:
-                        # 0.5초 동안 새 데이터가 없으면 여기로 옵니다. (Ctrl+C 감지 가능!)
+            # 2. 게임 시작 상태
+            in_run = True
+            while in_run:
+                # 소켓에서 JSON 메시지 뭉치를 받아옴
+                messages = server.read_messages()
+                
+                if messages is None:
+                    break # 게임 연결 끊김 감지, 메인 루프로 돌아가서 다시 대기
+                    
+                for parsed_data in messages:
+                    # 애니메이션 중이면 데이터 무시
+                    if not parsed_data.get("ready_for_command", False):
                         continue
-                    except ConnectionResetError:
-                        break # 게임이 강제 종료되었을 때
-
-                    # 버퍼에 쌓인 데이터를 줄바꿈(\n) 기준으로 하나씩 꺼내서 안전하게 처리
-                    while '\n' in buffer:
-                        line, buffer = buffer.split('\n', 1)
-                        raw_data = line.strip()
-                        if not raw_data: 
-                            continue
                         
-                        try:
-                            parsed_data = json.loads(raw_data)
-                            
-                            # [스팸 방지 1] 쿨다운
-                            if time.time() - last_command_time < command_cooldown:
-                                continue
-                                
-                            parsed_info = parse_state(parsed_data)
-                            
-                            if parsed_info and parsed_info.get("in_game"):
-                                combat = parsed_info.get("combat")
-                                current_turn = combat.get("turn", 0) if combat else 0
-                                
-                                # [스팸 방지 2] 턴 잠금 해제
-                                if waiting_for_next_turn:
-                                    if current_turn != last_turn:
-                                        print(f"\n[!] 새로운 턴 시작 감지! (Turn: {current_turn}) - 잠금 해제")
-                                        waiting_for_next_turn = False
-                                        need_to_print_state = True
-                                    else:
-                                        continue 
-                                
-                                # 상태 출력
-                                if need_to_print_state and combat and current_turn > 0:
-                                    print_state_summary(parsed_info)
-                                    need_to_print_state = False 
-                                
-                                # AI 명령 하달
-                                if "available_commands" in parsed_data:
-                                    cmds = parsed_data["available_commands"]
-                                    if "end" in cmds and current_turn > 0:
-                                        print(">>> AI 판단: 턴 종료 (end) 발사!")
-                                        conn.sendall(b"end\n")
-                                        
-                                        last_command_time = time.time()
-                                        waiting_for_next_turn = True
-                                        last_turn = current_turn
-                                        
-                        except json.JSONDecodeError:
-                            pass
-                            
-            print("\n[!] 게임 종료/연결 끊김. 다음 게임 접속 대기 중...")
+                    # --- 1. 메인 메뉴 (죽었거나 새로 켰을 때) ---
+                    if not parsed_data.get("in_game", False):
+                        cmds = parsed_data.get("available_commands", [])
+                        if "start" in cmds:
+                            print(">>> [메인 메뉴] 새 게임을 시작합니다 (Ironclad)")
+                            server.send_command("start ironclad\n")
+                            break # 커맨드를 보냈으면 다음 메시지는 무시하고 통신 루프 재시작
+                        continue
+
+                    # --- 2. 게임 중 (파싱 및 상황별 AI 라우팅) ---
+                    parsed_info = parse_state(parsed_data)
+                    if not parsed_info: continue
+
+                    action = None
+                    room_phase = parsed_info.get("room_phase", "UNKNOWN")
+                    
+                    if room_phase == "COMBAT":
+                        action = combat_ai.get_action(parsed_data, parsed_info)
+                    else:
+                        action = choice_ai.get_action(parsed_data, parsed_info)
+                        
+                    # AI가 결정을 내렸다면 게임에 전송
+                    if action:
+                        print(f"[{room_phase}] AI 결정 -> {action.strip()}")
+                        server.send_command(action)
+                        break 
+                        
+            print("\n[!] 런 종료. 새 게임 대기 중...")
+            server.close_connection()
             
         except KeyboardInterrupt:
-            print("\n[!] Ctrl+C 강제 종료 감지: 4090 서버를 완전히 셧다운합니다.")
-            server.close()
+            print("\n[!] Ctrl+C 강제 종료 감지. 서버를 내립니다.")
+            server.close_server()
             sys.exit(0)
-        except Exception as e:
-            print(f"에러 발생: {e}")
 
 if __name__ == "__main__":
     main()
